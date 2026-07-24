@@ -582,6 +582,15 @@ def poll_loop(scraper, auth, tracker):
 
             d = r.json()
 
+            # Dump único da estrutura da resposta REST para confirmar se
+            # existe algum campo de entrada pendente/ao vivo que devíamos ler.
+            if not getattr(poll_loop, "_keys_dumped", False):
+                poll_loop._keys_dumped = True
+                if isinstance(d, dict):
+                    print(f"[DIAG] Campos da resposta REST: {list(d.keys())}")
+                    print(f"[DIAG] pendingEntry presente? "
+                          f"{'sim' if d.get('pendingEntry') is not None else 'não/null'}")
+
             results = d.get("data", [])
             if results:
                 newest = results[0]
@@ -615,20 +624,27 @@ def poll_loop(scraper, auth, tracker):
 # ============================================================
 
 def run_socket(scraper, auth, tracker, cf_cookies, cf_ua):
-    cookie_header = "; ".join(f"{k}={v}" for k, v in cf_cookies.items())
     if not cf_ua:
-        cf_ua = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                 "AppleWebKit/537.36 (KHTML, like Gecko) "
-                 "Chrome/128.0.0.0 Safari/537.36")
+        cf_ua = scraper.headers.get("User-Agent") or (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/128.0.0.0 Safari/537.36")
 
-    http_session = requests.Session()
+    # IMPORTANTE: reutiliza a MESMA sessão do cloudscraper usada no /results.
+    # Ela já tem o fingerprint de navegador + os cookies do Cloudflare que
+    # fazem as chamadas REST passarem. Uma requests.Session() nova é
+    # bloqueada com 403 pelo Cloudflare no handshake do Socket.IO.
+    http_session = scraper
     http_session.headers.update({
         "User-Agent": cf_ua,
         "Origin": ORIGIN,
         "Referer": f"{ORIGIN}/",
     })
     for k, v in cf_cookies.items():
-        http_session.cookies.set(k, v, domain=".historicbet.com")
+        try:
+            http_session.cookies.set(k, v, domain=".historicbet.com")
+        except Exception:
+            pass
 
     sio = socketio.Client(
         reconnection=True,
@@ -734,22 +750,26 @@ def connect_socket(sio, auth, cf_cookies, cf_ua):
 
     print(f"[SOCKET] Conectando a {url} (path: {path})...")
 
+    # Começa em polling (usa o fingerprint do cloudscraper → passa pelo
+    # Cloudflare como o /results). Se o upgrade para websocket funcionar,
+    # o próprio Socket.IO faz sozinho depois do handshake.
     try:
         sio.connect(
             url,
             socketio_path=path,
             auth={"token": auth.access_token},
-            transports=["websocket"],
+            transports=["polling", "websocket"],
             headers=headers,
             wait_timeout=20,
         )
-    except Exception:
-        print("[SOCKET] WebSocket falhou, tentando polling...")
+    except Exception as e:
+        print(f"[SOCKET] Handshake polling+websocket falhou: {e}")
+        print("[SOCKET] Tentando somente websocket...")
         sio.connect(
             url,
             socketio_path=path,
             auth={"token": auth.access_token},
-            transports=["polling"],
+            transports=["websocket"],
             headers=headers,
             wait_timeout=20,
         )

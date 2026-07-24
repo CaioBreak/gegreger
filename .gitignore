@@ -9,3 +9,4 @@ venv/
 historico_resultados.json
 historico_entradas.json
 diagnostico_entradas.jsonl
+raw_events.jsonl

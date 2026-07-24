@@ -114,6 +114,43 @@ def diag_snapshot(source, pending, entries):
     except Exception as e:
         print(f"[DIAG] Erro ao gravar snapshot: {e}")
 
+
+# Log cru de TODOS os eventos do Socket.IO — usado para descobrir por
+# qual evento/campo o site manda a entrada AO VIVO.
+RAW_LOG = "raw_events.jsonl"
+_raw_counts = {}
+
+def _shrink_for_raw(data):
+    """Reduz payloads grandes (historyEntries com 20 itens) mantendo o resto."""
+    if isinstance(data, dict):
+        out = {}
+        for k, v in data.items():
+            if isinstance(v, list) and len(v) > 3:
+                out[k + "__len"] = len(v)
+                out[k + "__sample"] = v[:2]
+            else:
+                out[k] = v
+        return out
+    return data
+
+def diag_raw(event, data, cap=80):
+    """Grava o payload completo de um evento no raw_events.jsonl (com limite)."""
+    if not DIAG:
+        return
+    n = _raw_counts.get(event, 0)
+    if n >= cap:
+        return
+    _raw_counts[event] = n + 1
+    try:
+        with open(RAW_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "event": event,
+                "data": _shrink_for_raw(data),
+            }, ensure_ascii=False, default=str) + "\n")
+    except Exception as e:
+        print(f"[DIAG] raw erro: {e}")
+
 def append_resultado(resultado: dict):
     hist = load_json(HISTORICO_RESULTADOS)
     if hist and hist[0].get("id") == resultado.get("id"):
@@ -694,6 +731,12 @@ def run_socket(scraper, auth, tracker, cf_cookies, cf_ua):
         notify = data.get("notify", [])
         length = data.get("historyLength", "?")
         print(f"[META] {length} resultados | {len(entries)} entradas")
+        diag_raw("result:meta", data)
+        # Dump único das chaves do meta, para achar o campo da entrada ao vivo.
+        if not getattr(on_meta, "_keys_dumped", False):
+            on_meta._keys_dumped = True
+            if isinstance(data, dict):
+                print(f"[DIAG] Chaves do result:meta: {list(data.keys())}")
         diag_snapshot("socket:meta", pending, entries)
         save_entradas_bulk(entries)
         tracker.process_entries(entries)
@@ -703,19 +746,29 @@ def run_socket(scraper, auth, tracker, cf_cookies, cf_ua):
     @sio.on("result:user-update")
     def on_user_update(*args):
         print("[USER] Dados atualizados (possível entrada resolvida)")
+        # Suspeito principal da entrada ao vivo — grava o payload completo.
+        diag_raw("result:user-update", list(args))
 
     @sio.on("result:winners")
     def on_winners(data):
-        pass
+        diag_raw("result:winners", data)
 
     @sio.on("result:stats-update")
     def on_stats(data):
-        pass
+        diag_raw("result:stats-update", data)
 
     @sio.on("deck:changed")
     def on_deck(data):
         hora = data.get("hora", "?")
         print(f"[DECK] Troca de baralho: {hora}")
+        diag_raw("deck:changed", data)
+
+    @sio.on("*")
+    def catch_all(event, *args):
+        # Qualquer evento SEM handler dedicado — pode ser aqui que a
+        # entrada ao vivo é enviada (ex.: 'cataloguer:entry', 'signal:new').
+        print(f"[EVENTO?] Evento não tratado: {event}")
+        diag_raw(f"UNHANDLED:{event}", list(args))
 
     connect_socket(sio, auth, cf_cookies, cf_ua)
 

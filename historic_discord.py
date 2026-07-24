@@ -468,6 +468,18 @@ class EntryTracker:
                 print("[TRACKER] Histórico vazio, pronto para receber entradas")
             return
 
+        # TESTE DECISIVO: existe alguma entrada no historyEntries SEM
+        # resultado (result null/None/PENDING)? Se sim, é a entrada ao vivo.
+        if DIAG:
+            for e in entries:
+                res = e.get("result")
+                if res not in ("WIN", "LOSS"):
+                    print(f"[LIVE?] Entrada SEM resultado no historyEntries → "
+                          f"id={e.get('id')} "
+                          f"signal={parse_signal(e.get('signal'))} "
+                          f"gale={e.get('gale')} result={res!r} "
+                          f"(ESTA é a entrada ao vivo!)")
+
         if self.first_load:
             for entry in entries:
                 eid = entry.get("id")
@@ -664,23 +676,22 @@ def poll_loop(scraper, auth, tracker):
 # candidatos e mostra qual existe e o que retorna, para acharmos onde
 # fica a entrada pendente per-user.
 PROBE_PATHS = [
+    "/signals?gameType={g}",
+    "/signals?gameType={g}&status=pending",
+    "/signals?gameType={g}&status=active",
+    "/signals/active?gameType={g}",
+    "/signals/pending?gameType={g}",
+    "/signals/current?gameType={g}",
     "/cataloguer?gameType={g}",
     "/cataloguer/current?gameType={g}",
-    "/cataloguer/entries?gameType={g}",
-    "/cataloguer/entry?gameType={g}",
     "/cataloguer/pending?gameType={g}",
     "/entries?gameType={g}",
     "/entries/pending?gameType={g}",
-    "/entries/current?gameType={g}",
     "/user/entries?gameType={g}",
-    "/user/cataloguer?gameType={g}",
-    "/results/pending?gameType={g}",
-    "/signals?gameType={g}",
-    "/signals/current?gameType={g}",
 ]
 
 _probe_count = 0
-_PROBE_MAX = 6
+_PROBE_MAX = 12
 
 def probe_endpoints(scraper, auth):
     """Testa endpoints candidatos (algumas vezes, para pegar um momento
@@ -702,21 +713,30 @@ def probe_endpoints(scraper, auth):
             r = scraper.get(API_BASE + path, headers=h, timeout=10)
             status = r.status_code
             snippet = ""
+            nonempty = False
             if status == 200:
                 try:
                     j = r.json()
                     if isinstance(j, dict):
                         snippet = "dict keys=" + str(list(j.keys())[:12])
+                        # Destaca qualquer lista NÃO-VAZIA (a entrada ao vivo).
+                        listas = {k: len(v) for k, v in j.items()
+                                  if isinstance(v, list) and v}
+                        if listas:
+                            nonempty = True
+                            snippet += f"  🔥 NÃO-VAZIO={listas}  {str(j)[:250]}"
                     elif isinstance(j, list):
                         snippet = f"list[{len(j)}]"
                         if j:
-                            snippet += " item0=" + str(j[0])[:120]
+                            nonempty = True
+                            snippet += " 🔥 item0=" + str(j[0])[:200]
                     else:
                         snippet = str(j)[:120]
                 except Exception:
                     snippet = "(não-JSON) " + r.text[:80]
             if status == 200:
-                print(f"[PROBE] ✅ {status} {path}  {snippet}")
+                mark = "🔥🔥" if nonempty else "✅"
+                print(f"[PROBE] {mark} {status} {path}  {snippet}")
                 if DIAG:
                     try:
                         with open(RAW_LOG, "a", encoding="utf-8") as f:

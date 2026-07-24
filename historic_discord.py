@@ -657,6 +657,84 @@ def poll_loop(scraper, auth, tracker):
 
 
 # ============================================================
+# SNIFFER: descobrir o endpoint da entrada AO VIVO
+# ============================================================
+
+# Chamado quando o site manda shouldRefresh=true. Testa endpoints
+# candidatos e mostra qual existe e o que retorna, para acharmos onde
+# fica a entrada pendente per-user.
+PROBE_PATHS = [
+    "/cataloguer?gameType={g}",
+    "/cataloguer/current?gameType={g}",
+    "/cataloguer/entries?gameType={g}",
+    "/cataloguer/entry?gameType={g}",
+    "/cataloguer/pending?gameType={g}",
+    "/entries?gameType={g}",
+    "/entries/pending?gameType={g}",
+    "/entries/current?gameType={g}",
+    "/user/entries?gameType={g}",
+    "/user/cataloguer?gameType={g}",
+    "/results/pending?gameType={g}",
+    "/signals?gameType={g}",
+    "/signals/current?gameType={g}",
+]
+
+_probe_count = 0
+_PROBE_MAX = 6
+
+def probe_endpoints(scraper, auth):
+    """Testa endpoints candidatos (algumas vezes, para pegar um momento
+    com entrada ativa) e loga status + estrutura da resposta."""
+    global _probe_count
+    if _probe_count >= _PROBE_MAX:
+        return
+    _probe_count += 1
+    h = {
+        "Authorization": f"Bearer {auth.access_token}",
+        "Content-Type": "application/json",
+        "Origin": ORIGIN,
+        "Referer": f"{ORIGIN}/",
+    }
+    print(f"[PROBE] --- tentativa {_probe_count}/{_PROBE_MAX} ---")
+    for tpl in PROBE_PATHS:
+        path = tpl.format(g=GAME_TYPE)
+        try:
+            r = scraper.get(API_BASE + path, headers=h, timeout=10)
+            status = r.status_code
+            snippet = ""
+            if status == 200:
+                try:
+                    j = r.json()
+                    if isinstance(j, dict):
+                        snippet = "dict keys=" + str(list(j.keys())[:12])
+                    elif isinstance(j, list):
+                        snippet = f"list[{len(j)}]"
+                        if j:
+                            snippet += " item0=" + str(j[0])[:120]
+                    else:
+                        snippet = str(j)[:120]
+                except Exception:
+                    snippet = "(não-JSON) " + r.text[:80]
+            if status == 200:
+                print(f"[PROBE] ✅ {status} {path}  {snippet}")
+                if DIAG:
+                    try:
+                        with open(RAW_LOG, "a", encoding="utf-8") as f:
+                            f.write(json.dumps({
+                                "ts": datetime.now(timezone.utc).isoformat(),
+                                "event": f"PROBE:{path}",
+                                "status": status,
+                                "body": r.text[:2000],
+                            }, ensure_ascii=False) + "\n")
+                    except Exception:
+                        pass
+            elif status not in (404, 400):
+                print(f"[PROBE] ·  {status} {path}")
+        except Exception as e:
+            print(f"[PROBE] ERR {path}: {e}")
+
+
+# ============================================================
 # SOCKET.IO (modo preferido)
 # ============================================================
 
@@ -745,9 +823,14 @@ def run_socket(scraper, auth, tracker, cf_cookies, cf_ua):
 
     @sio.on("result:user-update")
     def on_user_update(*args):
-        print("[USER] Dados atualizados (possível entrada resolvida)")
+        print("[USER] Dados atualizados (shouldRefresh) → sondando endpoints...")
         # Suspeito principal da entrada ao vivo — grava o payload completo.
         diag_raw("result:user-update", list(args))
+        # Descobrir ONDE fica a entrada ao vivo (per-user).
+        try:
+            probe_endpoints(scraper, auth)
+        except Exception as e:
+            print(f"[PROBE] Erro geral: {e}")
 
     @sio.on("result:winners")
     def on_winners(data):

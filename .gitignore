@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Dados gerados em runtime pelo bot
+historico_resultados.json
+historico_entradas.json
+diagnostico_entradas.jsonl

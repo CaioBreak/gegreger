@@ -795,6 +795,23 @@ def run_socket(scraper, auth, tracker, cf_cookies, cf_ua):
     def connect():
         print(f"[SOCKET] Conectado! Entrando: {GAME_NAMES.get(GAME_TYPE)}...")
         sio.emit("cataloguer:join", {"gameType": GAME_TYPE})
+        # EXPERIMENTO: assinar canais candidatos para tentar receber a
+        # entrada AO VIVO. Se algum funcionar, um evento novo será
+        # capturado pelo catch-all [EVENTO?].
+        candidatos = [
+            ("signals:join", {"gameType": GAME_TYPE}),
+            ("signals:subscribe", {"gameType": GAME_TYPE}),
+            ("cataloguer:subscribe", {"gameType": GAME_TYPE}),
+            ("result:subscribe", {"gameType": GAME_TYPE}),
+            ("entry:join", {"gameType": GAME_TYPE}),
+            ("pattern:join", {"gameType": GAME_TYPE}),
+        ]
+        for ev, payload in candidatos:
+            try:
+                sio.emit(ev, payload)
+                print(f"[SUB?] Enviado subscribe candidato: {ev}")
+            except Exception as e:
+                print(f"[SUB?] Falha ao emitir {ev}: {e}")
 
     @sio.event
     def disconnect():

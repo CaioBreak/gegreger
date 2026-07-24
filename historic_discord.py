@@ -9,6 +9,7 @@ import cloudscraper
 import requests
 import json
 import time
+import threading
 import sys
 import os
 from datetime import datetime, timezone
@@ -259,6 +260,38 @@ def discord_resultado_entrada(entrada: dict):
     print(f"[DISCORD] Resultado: {result} | {signal} | {gale_txt}")
 
 
+def discord_entrada_com_resultado(entrada: dict):
+    signal = parse_signal(entrada.get("signal"))
+    result = entrada.get("result", "?")
+    gale = entrada.get("gale", 0)
+    max_gale = entrada.get("maxGale", "?")
+    emoji = SIGNAL_EMOJI.get(signal, "⚪")
+    gale_txt = "Sem Gale" if gale == 0 else f"Gale {gale}"
+
+    is_win = result == "WIN"
+    color = 0x22C55E if is_win else 0xEF4444
+    icon = "✅" if is_win else "❌"
+    game = GAME_NAMES.get(GAME_TYPE, "Bac Bo")
+
+    embed = {
+        "title": f"🎯 {emoji} {signal} ({gale_txt}) → {icon} {result}",
+        "description": (
+            f"Entrada no **{signal}** resolveu rápido → **{result}**"
+            + (f" (com Gale {gale})" if gale > 0 else "")
+        ),
+        "color": color,
+        "fields": [
+            {"name": "Jogo", "value": game, "inline": True},
+            {"name": "Entrada", "value": f"{emoji} {signal}", "inline": True},
+            {"name": "Resultado", "value": f"{icon} {result}", "inline": True},
+            {"name": "Gale", "value": f"{gale}/{max_gale}", "inline": True},
+        ],
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    discord_send([embed])
+    print(f"[DISCORD] Entrada+Resultado: {signal} {gale_txt} → {result}")
+
+
 def discord_resultado_bacbo(data: dict):
     winner = data.get("winner", "?")
     score = data.get("Score", "?")
@@ -290,6 +323,7 @@ class EntryTracker:
         self.known_entry_ids = set()
         self.notified_entry_ids = set()
         self.first_load = True
+        self._result_lock = threading.Lock()
 
     def process_pending(self, pending):
         if pending is None:
@@ -311,6 +345,14 @@ class EntryTracker:
             self.notified_entry_ids.add(pid)
             append_entrada(pending)
 
+    def _send_resultado_delayed(self, entry, delay):
+        def _send():
+            time.sleep(delay)
+            with self._result_lock:
+                discord_resultado_entrada(entry)
+        t = threading.Thread(target=_send, daemon=True)
+        t.start()
+
     def process_entries(self, entries):
         if not entries:
             if self.first_load:
@@ -331,7 +373,7 @@ class EntryTracker:
             print(f"[TRACKER] Histórico carregado: {len(entries)} entradas conhecidas")
             return
 
-        for entry in entries:
+        for entry in reversed(entries):
             eid = entry.get("id")
             if not eid:
                 continue
@@ -348,9 +390,7 @@ class EntryTracker:
                 if eid in self.notified_entry_ids:
                     discord_resultado_entrada(entry)
                 else:
-                    discord_nova_entrada(entry)
-                    time.sleep(3)
-                    discord_resultado_entrada(entry)
+                    discord_entrada_com_resultado(entry)
                 append_entrada(entry)
 
                 if eid == self.pending_id:
@@ -436,7 +476,7 @@ def fetch_full_history(scraper, token):
 # POLLING VIA REST API (fallback quando Socket.IO é bloqueado)
 # ============================================================
 
-POLL_INTERVAL = 3
+POLL_INTERVAL = 2
 
 def poll_loop(scraper, auth, tracker):
     """Consulta a API REST a cada POLL_INTERVAL segundos."""
@@ -484,8 +524,8 @@ def poll_loop(scraper, auth, tracker):
             pending = d.get("pendingEntry")
             if entries:
                 save_entradas_bulk(entries)
-            tracker.process_pending(pending)
             tracker.process_entries(entries)
+            tracker.process_pending(pending)
 
         except Exception as e:
             print(f"[POLL] Erro: {e}")
@@ -562,8 +602,8 @@ def run_socket(scraper, auth, tracker, cf_cookies, cf_ua):
         length = data.get("historyLength", "?")
         print(f"[META] {length} resultados | {len(entries)} entradas")
         save_entradas_bulk(entries)
-        tracker.process_pending(pending)
         tracker.process_entries(entries)
+        tracker.process_pending(pending)
         tracker.process_notify(notify)
 
     @sio.on("result:user-update")
@@ -651,8 +691,8 @@ def run():
     initial_entries = fetch_full_history(scraper, auth.access_token)
 
     tracker = EntryTracker()
-    if initial_entries:
-        for e in initial_entries:
+    if initial_entries is not None:
+        for e in (initial_entries or []):
             eid = e.get("id")
             if eid:
                 tracker.known_entry_ids.add(eid)

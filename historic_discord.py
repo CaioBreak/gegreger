@@ -4,15 +4,25 @@ Conecta ao Socket.IO do HistoricIA, escuta ENTRADAS (sinais de padrões)
 e RESULTADOS do Bac Bo, envia para Discord e salva histórico em arquivo.
 """
 
-import socketio
-import cloudscraper
-import requests
 import json
 import time
 import threading
 import sys
 import os
 from datetime import datetime, timezone
+
+# Dependências de runtime (não são necessárias para o modo --analisar).
+try:
+    import socketio
+    import cloudscraper
+    import requests
+except ImportError as _e:
+    socketio = None
+    cloudscraper = None
+    requests = None
+    _IMPORT_ERROR = _e
+else:
+    _IMPORT_ERROR = None
 
 # ============================================================
 # CONFIGURAÇÃO
@@ -30,6 +40,12 @@ GAME_TYPE = 1
 
 HISTORICO_RESULTADOS = "historico_resultados.json"
 HISTORICO_ENTRADAS = "historico_entradas.json"
+
+# Diagnóstico: grava o payload cru de cada evento para descobrir
+# se o site realmente envia a entrada ao vivo (pendingEntry no gale 0)
+# ou se só vemos o registro já resolvido. Coloque False para desligar.
+DIAG = True
+DIAG_LOG = "diagnostico_entradas.jsonl"
 
 # ============================================================
 GAME_NAMES = {1: "Bac Bo", 2: "Bac Bo BR", 3: "Football Studio",
@@ -66,6 +82,37 @@ def load_json(path):
 def save_json(path, data):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def _slim_entry(e):
+    """Extrai só os campos relevantes de uma entrada para o log."""
+    if not isinstance(e, dict):
+        return e
+    return {
+        "id": e.get("id"),
+        "signal": e.get("signal"),
+        "gale": e.get("gale"),
+        "maxGale": e.get("maxGale"),
+        "result": e.get("result"),
+    }
+
+
+def diag_snapshot(source, pending, entries):
+    """Grava um snapshot cru do que o site enviou (pending + topo do histórico)."""
+    if not DIAG:
+        return
+    try:
+        top = [_slim_entry(e) for e in (entries or [])[:5]]
+        record = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "source": source,
+            "pending": _slim_entry(pending) if pending else None,
+            "top_entries": top,
+        }
+        with open(DIAG_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as e:
+        print(f"[DIAG] Erro ao gravar snapshot: {e}")
 
 def append_resultado(resultado: dict):
     hist = load_json(HISTORICO_RESULTADOS)
@@ -322,8 +369,30 @@ class EntryTracker:
         self.last_entry_id = None
         self.known_entry_ids = set()
         self.notified_entry_ids = set()
+        self.first_seen = {}
         self.first_load = True
         self._result_lock = threading.Lock()
+
+    def _note_first_seen(self, eid, state, entry):
+        """Registra a PRIMEIRA vez que vemos um ID e em que estado.
+
+        state == 'PENDING'  → pegamos a entrada AO VIVO (bom).
+        state == 'RESOLVED' → só vimos o registro já com resultado (ruim:
+                              perdemos / o site não mandou a entrada ao vivo).
+        """
+        if eid in self.first_seen:
+            return
+        self.first_seen[eid] = state
+        signal = parse_signal(entry.get("signal"))
+        gale = entry.get("gale", 0)
+        result = entry.get("result")
+        if state == "PENDING":
+            print(f"[DIAG] 1ª vez id={eid}: ✅ AO VIVO (pending) "
+                  f"{signal} gale={gale}")
+        else:
+            print(f"[DIAG] 1ª vez id={eid}: ❌ JÁ RESOLVIDA "
+                  f"{signal} gale={gale} result={result}  "
+                  f"(entrada ao vivo NÃO foi vista!)")
 
     def process_pending(self, pending):
         if pending is None:
@@ -333,6 +402,8 @@ class EntryTracker:
             return
 
         pid = pending.get("id")
+        if pid:
+            self._note_first_seen(pid, "PENDING", pending)
         if pid and pid != self.pending_id:
             self.pending_id = pid
             self.pending_data = pending
@@ -365,6 +436,8 @@ class EntryTracker:
                 eid = entry.get("id")
                 if eid:
                     self.known_entry_ids.add(eid)
+                    # já conhecidas no arranque: não são "perdidas ao vivo"
+                    self.first_seen[eid] = "STARTUP"
             if entries:
                 top = entries[0].get("id")
                 if top:
@@ -380,6 +453,9 @@ class EntryTracker:
 
             result = entry.get("result")
             if eid not in self.known_entry_ids and result in ("WIN", "LOSS"):
+                # Primeira vez que vemos esse ID e já vem resolvido →
+                # a entrada ao vivo (pending) nunca foi capturada.
+                self._note_first_seen(eid, "RESOLVED", entry)
                 self.known_entry_ids.add(eid)
                 signal = parse_signal(entry.get("signal"))
                 gale = entry.get("gale", 0)
@@ -522,6 +598,7 @@ def poll_loop(scraper, auth, tracker):
 
             entries = d.get("historyEntries", [])
             pending = d.get("pendingEntry")
+            diag_snapshot("poll:rest", pending, entries)
             if entries:
                 save_entradas_bulk(entries)
             tracker.process_entries(entries)
@@ -601,6 +678,7 @@ def run_socket(scraper, auth, tracker, cf_cookies, cf_ua):
         notify = data.get("notify", [])
         length = data.get("historyLength", "?")
         print(f"[META] {length} resultados | {len(entries)} entradas")
+        diag_snapshot("socket:meta", pending, entries)
         save_entradas_bulk(entries)
         tracker.process_entries(entries)
         tracker.process_pending(pending)
@@ -678,6 +756,92 @@ def connect_socket(sio, auth, cf_cookies, cf_ua):
 
 
 # ============================================================
+# ANÁLISE DO LOG DE DIAGNÓSTICO
+# ============================================================
+
+def analisar_diagnostico():
+    """Lê o diagnostico_entradas.jsonl e responde a pergunta central:
+    o site manda a entrada AO VIVO (pending) ou só vemos o resultado?"""
+    if not os.path.exists(DIAG_LOG):
+        print(f"[ANÁLISE] Arquivo {DIAG_LOG} não existe ainda.")
+        print("Rode o bot normalmente por um tempo para gerar o log.")
+        return
+
+    seen_pending = {}      # id -> menor gale visto como pending
+    seen_resolved = {}     # id -> (gale, result) da 1ª vez resolvido
+    order_pending = {}     # id -> índice da linha em que virou pending
+    order_resolved = {}    # id -> índice da linha em que apareceu resolvido
+
+    linhas = 0
+    with open(DIAG_LOG, "r", encoding="utf-8") as f:
+        for idx, line in enumerate(f):
+            line = line.strip()
+            if not line:
+                continue
+            linhas += 1
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+
+            p = rec.get("pending")
+            if p and p.get("id") is not None:
+                pid = p["id"]
+                g = p.get("gale", 0) or 0
+                if pid not in seen_pending or g < seen_pending[pid]:
+                    seen_pending[pid] = g
+                order_pending.setdefault(pid, idx)
+
+            for e in rec.get("top_entries", []):
+                if not e or e.get("id") is None:
+                    continue
+                if e.get("result") in ("WIN", "LOSS"):
+                    eid = e["id"]
+                    if eid not in seen_resolved:
+                        seen_resolved[eid] = (e.get("gale", 0), e.get("result"))
+                        order_resolved[eid] = idx
+
+    ao_vivo = []       # apareceu como pending antes de resolver
+    so_resultado = []  # só apareceu já resolvido, nunca como pending
+    for eid in seen_resolved:
+        if eid in seen_pending:
+            ao_vivo.append(eid)
+        else:
+            so_resultado.append(eid)
+
+    total = len(seen_resolved)
+    perdeu_gale0 = [eid for eid in ao_vivo if seen_pending.get(eid, 0) > 0]
+
+    print("=" * 55)
+    print("  ANÁLISE DO DIAGNÓSTICO")
+    print("=" * 55)
+    print(f"  Snapshots lidos:              {linhas}")
+    print(f"  Entradas resolvidas no log:   {total}")
+    if total == 0:
+        print("  (Nenhuma entrada resolvida capturada ainda.)")
+        print("=" * 55)
+        return
+    print(f"  ✅ Vistas AO VIVO (pending):   {len(ao_vivo)}")
+    print(f"  ❌ Só vistas JÁ RESOLVIDAS:    {len(so_resultado)}")
+    print(f"     ↳ dessas ao vivo, começaram em gale>0: {len(perdeu_gale0)}")
+    print("=" * 55)
+    print("  VEREDITO:")
+    if so_resultado and len(so_resultado) >= len(ao_vivo):
+        print("  → A maioria das entradas NUNCA aparece como 'pending'.")
+        print("    O bot só vê o resultado e reconstrói a 'entrada'.")
+        print("    (Sua hipótese está correta.)")
+    elif perdeu_gale0 and len(perdeu_gale0) >= max(1, len(ao_vivo) // 2):
+        print("  → O site MANDA a entrada ao vivo, mas o bot frequentemente")
+        print("    só a pega a partir do gale 1+ (perde o gale 0).")
+    elif so_resultado:
+        print("  → Na maioria o bot pega ao vivo, mas ainda perde algumas")
+        print("    entradas (só vê o resultado).")
+    else:
+        print("  → O bot está pegando as entradas ao vivo corretamente.")
+    print("=" * 55)
+
+
+# ============================================================
 # MAIN
 # ============================================================
 
@@ -712,6 +876,15 @@ def run():
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] in ("--analisar", "--analise", "-a"):
+        analisar_diagnostico()
+        sys.exit(0)
+
+    if _IMPORT_ERROR is not None:
+        print(f"[ERRO] Falta uma dependência: {_IMPORT_ERROR}")
+        print("Instale com: pip install python-socketio cloudscraper requests")
+        sys.exit(1)
+
     print("=" * 55)
     print("  Historic BacBo → Discord Webhook")
     print("  Entradas + Resultados em tempo real")

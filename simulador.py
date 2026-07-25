@@ -324,8 +324,15 @@ def main():
             return
         rid = data.get("id")
         hora = data.get("Hora", "?")
-        atual = f"{sim.streak_len}x {NAME[sim.streak_side]}" if sim.streak_side else "-"
-        print(f"[BAC BO] {EMOJI[s]} {NAME[s]} | {hora} | seq atual: {atual}")
+        # sequência JÁ incluindo este resultado (para o log não confundir)
+        if s == "T":
+            base = f"{sim.streak_len}x {NAME[sim.streak_side]}" if sim.streak_side else "-"
+            seq = f"{base} (empate: neutro)"
+        elif s == sim.streak_side:
+            seq = f"{sim.streak_len + 1}x {NAME[s]}"
+        else:
+            seq = f"1x {NAME[s]}"
+        print(f"[BAC BO] {EMOJI[s]} {NAME[s]} | {hora} | sequência: {seq}")
         sim.on_result(s, rid)
         if sim.stopped:
             try:

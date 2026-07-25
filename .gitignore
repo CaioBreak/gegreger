@@ -10,3 +10,5 @@ historico_resultados.json
 historico_entradas.json
 diagnostico_entradas.jsonl
 raw_events.jsonl
+historico_grande.json
+sim_estado.json

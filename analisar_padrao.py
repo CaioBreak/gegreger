@@ -117,7 +117,28 @@ def resumo(triggers, titulo):
     print(f"  Saldo (pagto 1:1):     {net:+d} unidades")
 
 
-def analisar(min_streak):
+def meta_backtest(triggers, loss_threshold=3):
+    """Meta-estratégia: só ENTRA num sinal da base depois que a base
+    acumulou `loss_threshold`+ derrotas seguidas.
+
+    - Anulada (VOID/empate) é neutra: não conta como derrota nem zera o
+      contador — é simplesmente pulada.
+    - Enquanto a base seguir com o contador de derrotas >= limiar, todo
+      novo sinal vira entrada (inclusive se continuar perdendo).
+    """
+    loss_streak = 0
+    entradas = []
+    for t in triggers:
+        oc = t["outcome"]
+        if oc == "VOID":
+            continue  # neutro
+        if loss_streak >= loss_threshold:
+            entradas.append(t)  # entrada REAL
+        loss_streak = loss_streak + 1 if oc == "LOSS" else 0
+    return entradas
+
+
+def analisar(min_streak, loss_threshold=3):
     if not os.path.exists(RESULTS_FILE):
         raise SystemExit(f"Não achei '{RESULTS_FILE}' na pasta atual.")
     results, order = load_chrono(RESULTS_FILE)
@@ -176,12 +197,41 @@ def analisar(min_streak):
               f"{wr:5.1f}% | {w - l:+d}")
 
     # Amostra de entradas
-    print("\n=== Amostra (primeiras 8 entradas) ===")
+    print("\n=== Amostra (primeiras 8 entradas da base) ===")
     for t in trig[:8]:
         print(f"  seq {t['streak_len']}x {NAME[t['streak_side']]:6} "
               f"→ quebrou em {NAME[t['break']]:6} "
               f"→ apostei {NAME[t['bet']]:6} "
               f"→ veio {NAME.get(t['next'], '?'):6} = {t['outcome']}")
+
+    # ==========================================================
+    # META-ESTRATÉGIA: só entra após N derrotas seguidas da base
+    # ==========================================================
+    print("\n" + "#" * 55)
+    print(f"  META — só entra APÓS {loss_threshold} derrotas seguidas da base")
+    print("#" * 55)
+    entradas = meta_backtest(trig, loss_threshold)
+    resumo(entradas,
+           f"Entradas filtradas (base {min_streak}+, gatilho {loss_threshold} derrotas)")
+
+    # Varredura do gatilho de derrotas (com a base atual)
+    print("\n=== Varredura do gatilho de derrotas (base "
+          f"{min_streak}+) ===")
+    print("  derrotas | entradas | WIN | LOSS | taxa  | saldo")
+    for lt in range(1, 7):
+        e = meta_backtest(trig, lt)
+        w = sum(1 for t in e if t["outcome"] == "WIN")
+        l = sum(1 for t in e if t["outcome"] == "LOSS")
+        dec = w + l
+        wr = (w / dec * 100) if dec else 0
+        print(f"  {lt:>8} | {len(e):>8} | {w:>3} | {l:>4} | "
+              f"{wr:5.1f}% | {w - l:+d}")
+
+    # Sequência de resultados da base (para conferência visual)
+    seq_txt = "".join("W" if t["outcome"] == "WIN"
+                      else "L" if t["outcome"] == "LOSS"
+                      else "." for t in trig)
+    print(f"\n  Sequência da base (W=win L=loss .=anulada):\n  {seq_txt}")
 
 
 def _selftest():
@@ -202,6 +252,31 @@ def _selftest():
         todos_ok = todos_ok and ok
         print(f"  [{'OK ' if ok else 'FALHOU'}] Ex.{nome}: "
               f"esperado={esperado} obtido={got}")
+    # Self-test da META (só entra após N derrotas seguidas)
+    def mk(outcomes):
+        return [{"outcome": o} for o in outcomes]
+
+    metas = [
+        # (nome, outcomes da base, limiar, entradas esperadas [outcomes])
+        ("M1", ["W", "L", "L", "L", "W"], 3, ["W"]),
+        ("M2", ["W", "L", "L", "L", "L", "W"], 3, ["L", "W"]),
+        ("M3", ["L", "L", "W", "L", "L", "L", "W"], 3, ["W"]),
+        ("M4", ["W", "W", "W"], 3, []),
+        ("M5", ["L", "L", "L", ".", "W"], 3, ["W"]),   # anulada é neutra
+        ("M6", ["L", "L", "L", "L"], 3, ["L"]),
+    ]
+    for nome, outs, lt, esperado in metas:
+        # traduz "." em VOID
+        trg = [{"outcome": ("VOID" if o == "." else
+                            "WIN" if o == "W" else "LOSS")} for o in outs]
+        ent = meta_backtest(trg, lt)
+        got = ["WIN" if e["outcome"] == "WIN" else "LOSS" for e in ent]
+        esp = ["WIN" if o == "W" else "LOSS" for o in esperado]
+        ok = got == esp
+        todos_ok = todos_ok and ok
+        print(f"  [{'OK ' if ok else 'FALHOU'}] {nome}: "
+              f"esperado={esp} obtido={got}")
+
     print("\nSelf-test:", "PASSOU ✅" if todos_ok else "FALHOU ❌")
 
 
@@ -209,10 +284,16 @@ if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--test":
         _selftest()
         sys.exit(0)
-    ms = 6
+    ms = 6            # tamanho mínimo da sequência da base
+    lt = 3            # quantas derrotas seguidas da base antes de entrar
     if len(sys.argv) > 1:
         try:
             ms = int(sys.argv[1])
         except ValueError:
             pass
-    analisar(ms)
+    if len(sys.argv) > 2:
+        try:
+            lt = int(sys.argv[2])
+        except ValueError:
+            pass
+    analisar(ms, lt)

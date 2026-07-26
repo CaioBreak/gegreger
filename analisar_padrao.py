@@ -117,14 +117,20 @@ def resumo(triggers, titulo):
     print(f"  Saldo (pagto 1:1):     {net:+d} unidades")
 
 
-def meta_backtest(triggers, loss_threshold=3):
+def meta_backtest(triggers, loss_threshold=3, mode="chase"):
     """Meta-estratégia: só ENTRA num sinal da base depois que a base
     acumulou `loss_threshold`+ derrotas seguidas.
 
-    - Anulada (VOID/empate) é neutra: não conta como derrota nem zera o
-      contador — é simplesmente pulada.
-    - Enquanto a base seguir com o contador de derrotas >= limiar, todo
-      novo sinal vira entrada (inclusive se continuar perdendo).
+    Anulada (VOID/empate) é sempre neutra: não conta como derrota nem
+    zera o contador — é simplesmente pulada.
+
+    mode="chase" (PERSEGUIR): enquanto o contador seguir >= limiar, todo
+        novo sinal vira entrada (inclusive se continuar perdendo). Só um
+        WIN zera o contador.
+    mode="reset" (RESETAR): faz UMA entrada quando bate o limiar e já
+        zera o contador — precisa de uma nova sequência de `loss_threshold`
+        derrotas da base para entrar de novo. O resultado dessa entrada
+        não alimenta o contador.
     """
     loss_streak = 0
     entradas = []
@@ -134,6 +140,9 @@ def meta_backtest(triggers, loss_threshold=3):
             continue  # neutro
         if loss_streak >= loss_threshold:
             entradas.append(t)  # entrada REAL
+            if mode == "reset":
+                loss_streak = 0
+                continue  # zera e ignora o resultado desta entrada
         loss_streak = loss_streak + 1 if oc == "LOSS" else 0
     return entradas
 
@@ -206,26 +215,32 @@ def analisar(min_streak, loss_threshold=3):
 
     # ==========================================================
     # META-ESTRATÉGIA: só entra após N derrotas seguidas da base
+    # Compara as duas variantes: PERSEGUIR vs RESETAR
     # ==========================================================
     print("\n" + "#" * 55)
     print(f"  META — só entra APÓS {loss_threshold} derrotas seguidas da base")
     print("#" * 55)
-    entradas = meta_backtest(trig, loss_threshold)
-    resumo(entradas,
-           f"Entradas filtradas (base {min_streak}+, gatilho {loss_threshold} derrotas)")
+    resumo(meta_backtest(trig, loss_threshold, "chase"),
+           f"PERSEGUIR (continua entrando até ganhar) — gatilho {loss_threshold}")
+    resumo(meta_backtest(trig, loss_threshold, "reset"),
+           f"RESETAR (1 entrada por sequência de derrotas) — gatilho {loss_threshold}")
 
-    # Varredura do gatilho de derrotas (com a base atual)
-    print("\n=== Varredura do gatilho de derrotas (base "
-          f"{min_streak}+) ===")
-    print("  derrotas | entradas | WIN | LOSS | taxa  | saldo")
-    for lt in range(1, 7):
-        e = meta_backtest(trig, lt)
-        w = sum(1 for t in e if t["outcome"] == "WIN")
-        l = sum(1 for t in e if t["outcome"] == "LOSS")
+    def _st(ent):
+        w = sum(1 for t in ent if t["outcome"] == "WIN")
+        l = sum(1 for t in ent if t["outcome"] == "LOSS")
         dec = w + l
-        wr = (w / dec * 100) if dec else 0
-        print(f"  {lt:>8} | {len(e):>8} | {w:>3} | {l:>4} | "
-              f"{wr:5.1f}% | {w - l:+d}")
+        return len(ent), w, l, (w / dec * 100 if dec else 0), w - l
+
+    # Varredura do gatilho de derrotas: PERSEGUIR vs RESETAR lado a lado
+    print(f"\n=== Varredura do gatilho (base {min_streak}+) — "
+          f"PERSEGUIR vs RESETAR ===")
+    print("           |            PERSEGUIR             |            RESETAR")
+    print("  derrotas  | entr  WIN LOSS   taxa   saldo | entr  WIN LOSS   taxa   saldo")
+    for lt in range(1, 7):
+        c = _st(meta_backtest(trig, lt, "chase"))
+        r = _st(meta_backtest(trig, lt, "reset"))
+        print(f"  {lt:>7}   | {c[0]:>4} {c[1]:>4} {c[2]:>4}  {c[3]:5.1f}%  {c[4]:+4d} "
+              f"| {r[0]:>4} {r[1]:>4} {r[2]:>4}  {r[3]:5.1f}%  {r[4]:+4d}")
 
     # Sequência de resultados da base (para conferência visual)
     seq_txt = "".join("W" if t["outcome"] == "WIN"
@@ -269,12 +284,32 @@ def _selftest():
         # traduz "." em VOID
         trg = [{"outcome": ("VOID" if o == "." else
                             "WIN" if o == "W" else "LOSS")} for o in outs]
-        ent = meta_backtest(trg, lt)
+        ent = meta_backtest(trg, lt, "chase")
         got = ["WIN" if e["outcome"] == "WIN" else "LOSS" for e in ent]
         esp = ["WIN" if o == "W" else "LOSS" for o in esperado]
         ok = got == esp
         todos_ok = todos_ok and ok
-        print(f"  [{'OK ' if ok else 'FALHOU'}] {nome}: "
+        print(f"  [{'OK ' if ok else 'FALHOU'}] {nome} (chase): "
+              f"esperado={esp} obtido={got}")
+
+    # Self-test do modo RESETAR
+    metas_reset = [
+        # (nome, outcomes base, limiar, entradas esperadas [outcomes])
+        ("R1", ["L", "L", "W"], 2, ["W"]),
+        ("R2", ["L", "L", "L", "W"], 2, ["L"]),          # entra 1x, zera, W não entra
+        ("R3", ["L", "L", "L", "L", "W"], 2, ["L"]),     # entra 1x, precisa de 2 novas
+        ("R4", ["L", "L", "W", "L", "L", "W"], 2, ["W", "W"]),
+        ("R5", ["L", "L", "L", "L", "L", "W"], 2, ["L", "W"]),  # entra(L), zera, 2 novas derrotas, entra(W)
+    ]
+    for nome, outs, lt, esperado in metas_reset:
+        trg = [{"outcome": ("VOID" if o == "." else
+                            "WIN" if o == "W" else "LOSS")} for o in outs]
+        ent = meta_backtest(trg, lt, "reset")
+        got = ["WIN" if e["outcome"] == "WIN" else "LOSS" for e in ent]
+        esp = ["WIN" if o == "W" else "LOSS" for o in esperado]
+        ok = got == esp
+        todos_ok = todos_ok and ok
+        print(f"  [{'OK ' if ok else 'FALHOU'}] {nome} (reset): "
               f"esperado={esp} obtido={got}")
 
     print("\nSelf-test:", "PASSOU ✅" if todos_ok else "FALHOU ❌")

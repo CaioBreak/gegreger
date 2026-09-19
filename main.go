@@ -1,16 +1,3 @@
-// checker: varre todos os usernames de usernames.txt usando as proxies de
-// proxies.txt. Cada username so e re-checado a cada delayPorUsername (por qualquer
-// proxy); cada proxy manda no maximo proxyRateLimit/min. Checa
-// disponibilidade pelo endpoint /v1/usernames/validate. Os nomes disponiveis
-// (code 0) sao gravados em available.txt conforme vao sendo achados.
-//
-// Rodar (a partir da pasta do projeto):
-//
-//	go run .
-//
-// ou compilar:
-//
-//	go build -o checker.exe . && ./checker.exe
 package main
 
 import (
@@ -24,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -31,69 +19,34 @@ import (
 )
 
 const (
-	// endpoint que valida se um username pode ser criado.
-	// code 0 = disponivel, 1 = em uso, 2 = impróprio/bloqueado, 10 = formato invalido.
 	validateURL = "https://auth.roblox.com/v1/usernames/validate?birthday=2000-01-01&username=%s&context=Signup"
 
-	// >>> DELAY POR USERNAME <<< cada username so e re-checado este tempo depois
-	// da ultima checagem (por QUALQUER proxy). Ex.: 4s = cada nome a cada 4s.
-	delayPorUsername = 15 * time.Second
-
-	// teto de requests/min POR PROXY (o limite do IP e ~1000). Cada proxy manda
-	// quantas quiser ate esse teto.
-	proxyRateLimit = 1000
-
-	// quantas requests a proxy mantem EM VOO ao mesmo tempo. Serve so pra nao
-	// ficar presa na latencia (com 1, a proxy fica em ~1/latencia e nao alcanca o
-	// teto). O ticker garante que MESMO ASSIM nao passa de proxyRateLimit/min.
-	// 4 satura o teto pra latencia ate ~240ms; suba se suas proxies forem lentas.
-	// OBS: proxies datacenter/sticky (flashproxy) podem limitar conexoes
-	// concorrentes -> se der timeout em massa, volte pra 1.
+	delayPorUsername       = 4 * time.Second
+	proxyRateLimit        = 1000
 	requestsEmVooPorProxy = 2
+	startupRampPerSec     = 300
 
-	// STARTUP LEVE: sobe as proxies aos poucos (N por segundo) pra nao dar
-	// thundering-herd de TLS handshake (que causava "handshake timeout").
-	startupRampPerSec = 300
-
-	timeout = 10 * time.Second
-	// UA curto de proposito: menos bytes por request (a request cheia era ~120B).
+	timeout  = 10 * time.Second
 	userAgent = "Mozilla/5.0"
 
-	retriesTransient = 1 // re-tentativas em qualquer erro (conexao ou status != 200)
+	retriesTransient = 1
 
 	usernamesFile = "usernames.txt"
 	proxiesFile   = "proxies.txt"
 	outputFile    = "available.txt"
 
-	// MODO MONITORAMENTO: true = fica varrendo a lista em loop infinito (ciclos),
-	// pra pegar um nome no instante que liberar. false = uma passada so e termina.
 	loopForever = true
-	// pula os nomes ja achados disponiveis nos proximos ciclos (nao adianta
-	// re-checar um nome que ja esta livre).
-	skipFound = true
+	skipFound   = true
 
-	// NOTIFICACAO DISCORD: quando true, envia cada username disponivel pra webhook
-	// abaixo marcando @everyone. Envio direto (sem proxy), com 1 worker serializado
-	// que respeita o rate limit do Discord.
 	webhookEnabled = true
 	discordWebhook = "https://discord.com/api/webhooks/1525733217343111238/i6DdiTJyHQbJw02dWg6HHUbqPKiTwzk_TpXOEd4yZGfsyeO6sc0ZxBcu1xf26U7EhIFz"
 
-	// AUTO-CLAIM: quando true, tenta trocar seu username para o nome disponivel
-	// (custa 1000 Robux por troca).
-	// ATENCAO: a troca NAO fica em auth.roblox.com/v2/usernames (essa rota nao
-	// existe -> 404 em tudo, inclusive no pre-flight do CSRF). O endpoint certo e
-	// POST https://auth.roblox.com/v2/username (SINGULAR) com {username,password}.
-	autoClaimEnabled    = true
-	changeUsernameURL   = "https://auth.roblox.com/v2/username"
-	roblosecurityCookie = "_|WARNING:-DO-NOT-SHARE-THIS.--Sharing-this-will-allow-someone-to-log-in-as-you-and-to-steal-your-ROBUX-and-items.|_CAEQAhoGCAIQBBgBIhsKBGR1aWQSEzc3NDM2NDYyODIwNTUyNzgyNTAiFQoFdW5hbWUSDHRvb3Nsb3dfMDAwMiISCgN1aWQSCzExNjgzNjUwNzE1KAM.KOYmQ8mCtmwx7EjhgwSfPvx82x4wvoKtw9Rr3lpohtnFP7_CBxFLW6wpAdXfZvz_ctK2xnPnTUHxwygjWsgVDPC5JxKQuRtOkWWmOyc89sQ30Cp6zb5PcJEptHSsQs6hnH5e2fvGFAIXDNuZYMI9XWIrQHBCCLfhau-n0zh4BWogGK5sCA5YWOmA1C3KuQZmJBNNMoDB0R7ZVgaKJtmsd-mEIW17-Nki1DQvLNz3dBEEYJVydk2bI6Dr8SwL5pK2-_S9RalIaF-ikqWixpAhsxlRaGRGACkQKc6g7KRf70K9ZbHl-N0shkzvlUhv6lfZ3Zey0BiKh9LKWFl4BJFw0EXoh1ArPN7Y5OheswYkKsYpc6fBbyzI7bp_6nhcR8zC7RTWkvxuGrQobv5gI8riUg1lwieaCw_9sXcvvsAWksc5XH3P9eQRzvE26irRFNHmIf7fg_OgoKKlRLfnrjUcnow0nW3wGN59Gk2-97BpbdFIQrRRX6XqjB1DsZYPdODnjgfbIFZnfeLHgcymLL4u4MSJVjIFtOIgcgjMXG5VFiSb-T7S-xm8A_mVUAsiQqdiakJm0iGUamDGlKLM3YBNnLq22CR5g44O0d3OOWUuopYZnExzEqkBMWrKArVnxXK02RAPf2GmLmDtqi1Jwhp7bAQQUc5kAiPyIEDEqGrpJEx0qEZvUacILjBQXxmKdtRIy3JCUxu0Z1Vzb2Cn3_0-SaTWQWeTZsOwZPmFVDDw2yvba6_LbxdvcKnKb3sybNnGdBz-yLTxTCk3I2t3E7iaze2bmxtwYpSrkawfDuh9JMyEGdLcakHGH001JMUrSEKa2hiRSYv9KZFfSt2Ft6mXrEz46FYEWeXBJYvVAjiP7y6qnnTxdvTpiWPKZmuFwqEjonxZjus2fCLQr04nS135qA.mORwmLaLkoWobOrgrph9cu1MzcY"
-	robloxPassword      = "SenhaGG123!"
+	autoClaimEnabled = true
+	cookieFile       = "cookie.txt"
 )
 
-// intervalo minimo entre requests de UMA proxy (o teto de proxyRateLimit).
 const proxyMinInterval = time.Minute / proxyRateLimit
 
-// cache de sessao TLS COMPARTILHADO por todas as proxies: permite handshake
-// abreviado (resumption) nas reconexoes, cortando bytes/tempo de TLS.
 var tlsSessionCache = tls.NewLRUClientSessionCache(4096)
 
 var (
@@ -103,23 +56,17 @@ var (
 	blockedCount   atomic.Int64
 	errorCount     atomic.Int64
 	startTime      time.Time
-	// nomes ja achados disponiveis (pra dedupe da saida e skip nos proximos ciclos)
 	foundAvailable sync.Map
-	// diagnostico: proxies que realmente entraram em operacao e latencia media.
-	activeProxies atomic.Int64 // proxies com client valido, em loop
-	latSumMs      atomic.Int64 // soma acumulada das latencias (ms)
-	latCount      atomic.Int64 // qtd de requests medidas
+	activeProxies  atomic.Int64
+	latSumMs       atomic.Int64
+	latCount       atomic.Int64
 )
 
-// CPM/EPM contados em JANELA DESLIZANTE de 60s, atualizada A CADA request.
-// perMinute() = quantos eventos aconteceram nos ultimos 60 segundos = a taxa real.
 var (
-	cpmWin rateWindow // requests validas por minuto
-	epmWin rateWindow // erros de conexao por minuto
+	cpmWin rateWindow
+	epmWin rateWindow
 )
 
-// rateWindow: 60 buckets de 1s. add() marca o evento no segundo atual e zera os
-// segundos que ja sairam da janela; perMinute() soma os 60 buckets.
 type rateWindow struct {
 	mu      sync.Mutex
 	buckets [60]int64
@@ -131,10 +78,10 @@ func (r *rateWindow) advance(now int64) {
 		return
 	}
 	if now-r.lastSec >= 60 {
-		r.buckets = [60]int64{} // passou +1min sem eventos: zera tudo
+		r.buckets = [60]int64{}
 	} else {
 		for s := r.lastSec + 1; s <= now; s++ {
-			r.buckets[s%60] = 0 // zera cada segundo que passou
+			r.buckets[s%60] = 0
 		}
 	}
 	r.lastSec = now
@@ -160,7 +107,6 @@ func (r *rateWindow) perMinute() int64 {
 	return sum
 }
 
-// markValid/markError: chamados a cada request -> total + janela deslizante.
 func markValid() { checkedCount.Add(1); cpmWin.add() }
 func markError() { errorCount.Add(1); epmWin.add() }
 
@@ -171,7 +117,6 @@ type validateResp struct {
 
 // ---- log compacto (uma linha por username) ----
 
-// useColor liga/desliga as cores ANSI. Desligue se for redirecionar pra arquivo.
 const useColor = true
 
 const (
@@ -190,7 +135,6 @@ func colorize(c, s string) string {
 	return c + s + cReset
 }
 
-// logLine imprime uma linha compacta e alinhada: TAG  username  detalhe
 func logLine(color, tag, username string, detail string) {
 	tagStr := colorize(color, fmt.Sprintf("%-5s", tag))
 	rate := colorize(cGray, fmt.Sprintf("cpm:%d epm:%d", cpmWin.perMinute(), epmWin.perMinute()))
@@ -201,7 +145,6 @@ func logLine(color, tag, username string, detail string) {
 	fmt.Printf("%s %-16s %-22s %s\n", tagStr, username, detail, rate)
 }
 
-// trimErr reduz o erro ao motivo essencial (tira o "Get \"url\":" ruidoso).
 func trimErr(err error) string {
 	s := err.Error()
 	if i := strings.LastIndex(s, ": "); i >= 0 && i+2 < len(s) {
@@ -212,23 +155,19 @@ func trimErr(err error) string {
 
 // ---- notificacao Discord ----
 
-// fila de usernames pra notificar; 1 worker consome e serializa os envios.
 var webhookQueue = make(chan string, 256)
 
-// client dedicado da webhook: envio DIRETO (sem proxy), separado do checker.
 var webhookClient = &http.Client{Timeout: 15 * time.Second}
 
-// webhookWorker consome a fila e posta cada nome, respeitando rate limit.
 func webhookWorker() {
 	for username := range webhookQueue {
 		postWebhook(username)
 	}
 }
 
-// postWebhook manda 1 mensagem marcando @everyone; trata 429 (retry_after).
 func postWebhook(username string) {
 	payload := map[string]any{
-		"content":          fmt.Sprintf("@everyone\n✅ **Username disponivel:** `%s`", username),
+		"content":          fmt.Sprintf("@everyone\n**Username disponivel:** `%s`", username),
 		"allowed_mentions": map[string]any{"parse": []string{"everyone"}},
 	}
 	body, _ := json.Marshal(payload)
@@ -247,7 +186,6 @@ func postWebhook(username string) {
 			logLine(cGreen, "HOOK", username, "enviado ao Discord")
 			return
 		case resp.StatusCode == 429:
-			// respeita o retry_after informado pelo Discord
 			var ra struct {
 				RetryAfter float64 `json:"retry_after"`
 			}
@@ -269,16 +207,10 @@ func postWebhook(username string) {
 // ---- auto-claim de username ----
 
 var (
-	claimMu sync.Mutex
-	// claimStarted trava ANTES da request: sem isso, dois nomes achados livres no
-	// mesmo instante disparam dois claims e a conta paga 1000 Robux DUAS vezes
-	// (alreadyClaimed so era setado depois do 200, tarde demais).
+	claimMu        sync.Mutex
 	claimStarted   bool
 	alreadyClaimed bool
 )
-
-// client dedicado do claim (direto, sem proxy) — separado do da webhook.
-var claimClient = &http.Client{Timeout: 20 * time.Second}
 
 func notifyClaim(username, msg string) {
 	if !webhookEnabled {
@@ -312,209 +244,88 @@ func notifyClaim(username, msg string) {
 	}
 }
 
-// newClaimReq monta o POST da troca. csrf vazio = request de pre-flight (o
-// Roblox responde 403 com o header X-CSRF-TOKEN, que reenviamos na 2a chamada).
-func newClaimReq(payload []byte, csrf string) (*http.Request, error) {
-	req, err := http.NewRequest(http.MethodPost, changeUsernameURL, bytes.NewReader(payload))
-	if err != nil {
-		return nil, err
+func releaseClaim() {
+	claimMu.Lock()
+	if !alreadyClaimed {
+		claimStarted = false
 	}
-	req.Header.Set("Content-Type", "application/json;charset=UTF-8")
-	req.Header.Set("Accept", "application/json, text/plain, */*")
-	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
-	req.Header.Set("Cookie", ".ROBLOSECURITY="+roblosecurityCookie)
-	req.Header.Set("User-Agent", chefUserAgent)
-	req.Header.Set("Origin", "https://www.roblox.com")
-	req.Header.Set("Referer", "https://www.roblox.com/")
-	req.Header.Set("Sec-Ch-Ua", `"Chromium";v="138", "Google Chrome";v="138", "Not-A.Brand";v="24"`)
-	req.Header.Set("Sec-Ch-Ua-Mobile", "?0")
-	req.Header.Set("Sec-Ch-Ua-Platform", `"Windows"`)
-	req.Header.Set("Sec-Fetch-Dest", "empty")
-	req.Header.Set("Sec-Fetch-Mode", "cors")
-	req.Header.Set("Sec-Fetch-Site", "same-site")
-	if csrf != "" {
-		req.Header.Set("X-CSRF-TOKEN", csrf)
-	}
-	return req, nil
+	claimMu.Unlock()
 }
 
-// claimFail loga + notifica e, quando a falha comprovadamente NAO gastou Robux,
-// libera a trava pra tentar no proximo nome livre.
-func claimFail(username, detail, msg string, releaseLock bool) {
-	if releaseLock {
-		claimMu.Lock()
-		if !alreadyClaimed {
-			claimStarted = false
-		}
-		claimMu.Unlock()
-	}
-	logLine(cRed, "CLAIM", username, detail)
-	notifyClaim(username, msg)
-}
-
-func claimUsername(username string) {
+func attemptClaim(username string) {
 	claimMu.Lock()
 	if claimStarted {
 		claimMu.Unlock()
 		logLine(cGray, "CLAIM", username, "troca ja em andamento/feita")
 		return
 	}
-	claimStarted = true // trava ANTES de sair a request (evita gasto duplo)
+	claimStarted = true
 	claimMu.Unlock()
 
-	payload, _ := json.Marshal(map[string]string{
-		"username": username,
-		"password": robloxPassword,
-	})
+	logLine(cYellow, "CLAIM", username, "iniciando auto-claim...")
 
-	// --- 1) pre-flight: pega o X-CSRF-TOKEN (403 esperado aqui) ---
-	req, err := newClaimReq(payload, "")
+	cookie, err := os.ReadFile(cookieFile)
 	if err != nil {
-		claimFail(username, "erro montando request: "+trimErr(err), fmt.Sprintf("❌ **Falha ao trocar username para** `%s`\n**Motivo:** %s", username, trimErr(err)), true)
+		logLine(cRed, "CLAIM", username, "erro ao ler cookie.txt: "+err.Error())
+		notifyClaim(username, fmt.Sprintf("**Falha ao clamar** `%s`: erro ao ler cookie — %s", username, err.Error()))
+		releaseClaim()
 		return
 	}
-	resp, err := claimClient.Do(req)
+
+	cookieStr := strings.TrimSpace(string(cookie))
+	if cookieStr == "" {
+		logLine(cRed, "CLAIM", username, "cookie.txt vazio")
+		notifyClaim(username, fmt.Sprintf("**Falha ao clamar** `%s`: cookie.txt vazio", username))
+		releaseClaim()
+		return
+	}
+
+	start := time.Now()
+	cmd := exec.Command("node", "chef_solver_wrapper.js", username, cookieStr)
+	output, err := cmd.CombinedOutput()
+	elapsed := time.Since(start)
+
+	outStr := strings.TrimSpace(string(output))
+
 	if err != nil {
-		reason := trimErr(err)
-		claimFail(username, "erro: "+reason, fmt.Sprintf("❌ **Falha ao trocar username para** `%s`\n**Motivo:** erro de conexao — %s", username, reason), true)
-		return
-	}
-	csrfToken := resp.Header.Get("X-Csrf-Token")
-	firstBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-	firstStatus := resp.StatusCode
-	resp.Body.Close()
-
-	// o pre-flight ja pode ter trocado o nome se o cookie tinha token valido em
-	// cache do lado do Roblox — na pratica ele responde 403 + token.
-	if firstStatus == http.StatusOK {
-		claimMu.Lock()
-		alreadyClaimed = true
-		claimMu.Unlock()
-		logLine(cGreen, "CLAIM", username, "USERNAME TROCADO COM SUCESSO!")
-		notifyClaim(username, fmt.Sprintf("✅ **Username trocado com sucesso para** `%s`!", username))
-		return
-	}
-
-	if csrfToken == "" {
-		hint := ""
-		switch firstStatus {
-		case http.StatusNotFound:
-			hint = " (404: URL da troca errada — use auth.roblox.com/v2/username, no singular)"
-		case http.StatusUnauthorized:
-			hint = " (401: .ROBLOSECURITY invalido/expirado)"
-		}
-		detail := fmt.Sprintf("sem CSRF, status %d%s: %s", firstStatus, hint, string(firstBody))
-		claimFail(username, detail, fmt.Sprintf("❌ **Falha ao trocar username para** `%s`\n**Status:** %d%s\n**Resposta:** %s", username, firstStatus, hint, string(firstBody)), true)
-		return
-	}
-
-	// --- 2) troca de verdade, agora com o token ---
-	// O token pode rotacionar/expirar entre o pre-flight e este POST. Quando isso
-	// acontece o Roblox responde 403 "Token Validation Failed" JA COM o token novo
-	// no header X-Csrf-Token: basta reenviar com ele (1 vez, pra nao virar loop).
-	csrfRetried := false
-	for {
-		req, err = newClaimReq(payload, csrfToken)
-		if err != nil {
-			claimFail(username, "erro montando request: "+trimErr(err), fmt.Sprintf("❌ **Falha ao trocar username para** `%s`\n**Motivo:** %s", username, trimErr(err)), true)
-			return
-		}
-		resp, err = claimClient.Do(req)
-		if err != nil {
-			// erro de rede DEPOIS do envio: pode ter passado no servidor -> nao libera
-			// a trava, pra nao arriscar pagar 1000 Robux de novo.
-			reason := trimErr(err)
-			claimFail(username, "erro no claim (estado incerto): "+reason, fmt.Sprintf("⚠️ **Troca para** `%s` **com resultado desconhecido**\n**Motivo:** %s — confira a conta manualmente", username, reason), false)
-			return
-		}
-		// 403 SEM rblx-challenge-id = CSRF, nao 2FA. Com token novo no header,
-		// reenvia; a request anterior nao debitou nada (foi rejeitada na borda).
-		if resp.StatusCode == http.StatusForbidden && resp.Header.Get("Rblx-Challenge-Id") == "" && !csrfRetried {
-			if newTok := resp.Header.Get("X-Csrf-Token"); newTok != "" && newTok != csrfToken {
-				resp.Body.Close()
-				csrfToken = newTok
-				csrfRetried = true
-				logLine(cYellow, "CLAIM", username, "CSRF rotacionou, reenviando com token novo")
-				continue
+		logLine(cRed, "CLAIM", username, fmt.Sprintf("falhou apos %v: %s", elapsed, trimErr(err)))
+		if outStr != "" {
+			lines := strings.Split(outStr, "\n")
+			for _, line := range lines {
+				line = strings.TrimSpace(line)
+				if line != "" {
+					logLine(cGray, "CHEF", username, line)
+				}
 			}
 		}
-		break
+		notifyClaim(username, fmt.Sprintf("**Falha ao clamar** `%s`\n**Motivo:** %s (levou %v)", username, trimErr(err), elapsed))
+		releaseClaim()
+		return
 	}
-	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
 
-	switch {
-	case resp.StatusCode == http.StatusOK:
+	if strings.Contains(outStr, "[WRAPPER] SUCCESS") {
 		claimMu.Lock()
 		alreadyClaimed = true
 		claimMu.Unlock()
-		logLine(cGreen, "CLAIM", username, "USERNAME TROCADO COM SUCESSO!")
-		notifyClaim(username, fmt.Sprintf("✅ **Username trocado com sucesso para** `%s`!", username))
-
-	case resp.StatusCode == http.StatusForbidden && resp.Header.Get("Rblx-Challenge-Id") != "":
-		// challenge do Roblox. So o "chef" e resolvido automaticamente aqui.
-		challengeID := resp.Header.Get("Rblx-Challenge-Id")
-		challengeType := resp.Header.Get("Rblx-Challenge-Type")
-		challengeMeta := resp.Header.Get("Rblx-Challenge-Metadata")
-
-		if !strings.EqualFold(challengeType, "chef") {
-			// blocksession / 2FA por email / captcha: precisa de acao humana.
-			detail := fmt.Sprintf("challenge '%s' nao automatizavel — resolva manualmente", challengeType)
-			claimFail(username, detail, fmt.Sprintf("❌ **Falha ao trocar username para** `%s`\n**Motivo:** challenge `%s` (ação manual necessária)", username, challengeType), true)
-			break
+		logLine(cGreen, "CLAIM", username, fmt.Sprintf("USERNAME CLAMADO COM SUCESSO! (levou %v)", elapsed))
+		notifyClaim(username, fmt.Sprintf("**Username clamado com sucesso:** `%s`! (levou %v)", username, elapsed))
+	} else {
+		logLine(cRed, "CLAIM", username, fmt.Sprintf("solver nao retornou sucesso (levou %v)", elapsed))
+		if outStr != "" {
+			lines := strings.Split(outStr, "\n")
+			for _, line := range lines {
+				line = strings.TrimSpace(line)
+				if line != "" {
+					logLine(cGray, "CHEF", username, line)
+				}
+			}
 		}
-
-		logLine(cYellow, "CLAIM", username, "challenge chef recebido, resolvendo...")
-		retryType, retryMeta, err := solveChef(csrfToken, challengeID, challengeMeta)
-		if err != nil {
-			// falha ANTES de reenviar o claim -> nao debitou -> libera a trava.
-			claimFail(username, "chef falhou: "+trimErr(err), fmt.Sprintf("❌ **Falha ao trocar username para** `%s`\n**Motivo:** solver do chef falhou — %s", username, trimErr(err)), true)
-			break
-		}
-
-		// chef resolvido: reenvia o POST /v2/username com os headers rblx-challenge-*.
-		// O type e o metadata vem do solveChef (twostepverification + prova/metadata),
-		// seguindo o fluxo do roblox2fapayout — NAO type "chef".
-		req2, err := newClaimReq(payload, csrfToken)
-		if err != nil {
-			claimFail(username, "erro montando reenvio: "+trimErr(err), fmt.Sprintf("❌ **Falha ao trocar username para** `%s`\n**Motivo:** %s", username, trimErr(err)), true)
-			break
-		}
-		req2.Header.Set("Rblx-Challenge-Id", challengeID)
-		req2.Header.Set("Rblx-Challenge-Type", retryType)
-		req2.Header.Set("Rblx-Challenge-Metadata", retryMeta)
-
-		resp2, err := claimClient.Do(req2)
-		if err != nil {
-			// erro de rede depois do reenvio: estado incerto -> nao libera a trava.
-			claimFail(username, "reenvio pos-chef (estado incerto): "+trimErr(err), fmt.Sprintf("⚠️ **Troca para** `%s` **com resultado desconhecido**\n**Motivo:** %s — confira a conta manualmente", username, trimErr(err)), false)
-			break
-		}
-		body2, _ := io.ReadAll(io.LimitReader(resp2.Body, 8192))
-		resp2.Body.Close()
-
-		if resp2.StatusCode == http.StatusOK {
-			claimMu.Lock()
-			alreadyClaimed = true
-			claimMu.Unlock()
-			logLine(cGreen, "CLAIM", username, "USERNAME TROCADO COM SUCESSO! (pos-chef)")
-			notifyClaim(username, fmt.Sprintf("✅ **Username trocado com sucesso para** `%s`! (chef resolvido)", username))
-		} else {
-			releaseLock := resp2.StatusCode == http.StatusBadRequest // 400 nao debita
-			claimFail(username, fmt.Sprintf("reenvio pos-chef falhou %d: %s", resp2.StatusCode, string(body2)), fmt.Sprintf("❌ **Falha ao trocar username para** `%s` (pos-chef)\n**Status:** %d\n**Resposta:** %s", username, resp2.StatusCode, string(body2)), releaseLock)
-		}
-
-	case resp.StatusCode == http.StatusBadRequest:
-		// 400 = recusa validada (senha errada, nome ja pego, saldo insuficiente,
-		// filtro): nao debitou nada, entao libera pro proximo nome.
-		claimFail(username, fmt.Sprintf("recusado 400: %s", string(respBody)), fmt.Sprintf("❌ **Falha ao trocar username para** `%s`\n**Status:** 400\n**Resposta:** %s", username, string(respBody)), true)
-
-	default:
-		claimFail(username, fmt.Sprintf("falhou %d: %s", resp.StatusCode, string(respBody)), fmt.Sprintf("❌ **Falha ao trocar username para** `%s`\n**Status:** %d\n**Resposta:** %s", username, resp.StatusCode, string(respBody)), false)
+		notifyClaim(username, fmt.Sprintf("**Falha ao clamar** `%s`\n**Motivo:** solver nao retornou sucesso (levou %v)", username, elapsed))
+		releaseClaim()
 	}
 }
 
-// ---- reaproveitado do proxytester (main.go) ----
+// ---- proxy ----
 
 func normalizeProxy(raw string) string {
 	raw = strings.TrimSpace(raw)
@@ -550,23 +361,15 @@ func newProxyClient(proxy string) (*http.Client, error) {
 			Timeout:   10 * time.Second,
 			KeepAlive: 60 * time.Second,
 		}).DialContext,
-		// HTTP/2 desligado: proxies rotativos com CONNECT quebram em h2 (EOF).
 		ForceAttemptHTTP2: false,
 		TLSNextProto:      map[string]func(string, *tls.Conn) http.RoundTripper{},
-		// TLS 1.3 + cache de sessao COMPARTILHADO por todas as proxies: apos o 1o
-		// handshake completo, novas conexoes (mesmo por outra proxy) fazem handshake
-		// ABREVIADO (resumption) -> muito menos bytes/tempo por reconexao.
-		// (se comecar a falhar handshake em massa, troque por tls.VersionTLS12)
 		TLSClientConfig: &tls.Config{
 			MinVersion:         tls.VersionTLS13,
 			ClientSessionCache: tlsSessionCache,
 		},
-		// varias requests em voo por proxy -> ate requestsEmVooPorProxy conexoes,
-		// reusadas via keep-alive (o cache de sessao TLS barateia as extras).
-		MaxIdleConns:        requestsEmVooPorProxy,
-		MaxIdleConnsPerHost: requestsEmVooPorProxy,
-		MaxConnsPerHost:     requestsEmVooPorProxy,
-		// conexao ociosa segura por muito mais tempo -> menos reconexao/handshake.
+		MaxIdleConns:          requestsEmVooPorProxy,
+		MaxIdleConnsPerHost:   requestsEmVooPorProxy,
+		MaxConnsPerHost:       requestsEmVooPorProxy,
 		IdleConnTimeout:       5 * time.Minute,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ResponseHeaderTimeout: 10 * time.Second,
@@ -578,7 +381,6 @@ func newProxyClient(proxy string) (*http.Client, error) {
 
 // ---- checagem ----
 
-// checkOnce faz UMA request e devolve (statusHTTP, code, erro).
 func checkOnce(client *http.Client, username string) (int, int, error) {
 	reqURL := fmt.Sprintf(validateURL, url.QueryEscape(username))
 	req, err := http.NewRequest(http.MethodGet, reqURL, nil)
@@ -608,10 +410,6 @@ func checkOnce(client *http.Client, username string) (int, int, error) {
 	return resp.StatusCode, vr.Code, nil
 }
 
-// checkUsername checa 1 username com ate retriesTransient retries. Conta POR
-// TENTATIVA: toda request que erra (QUALQUER erro, ou status != 200) vira EPM;
-// toda resposta 200 valida vira CPM. Assim nenhum erro escapa da contagem, nem
-// os desconhecidos (ex.: "timeout awaiting response headers").
 func checkUsername(client *http.Client, proxy, username string, availableOut chan<- string) {
 	for attempt := 0; ; attempt++ {
 		reqStart := time.Now()
@@ -619,7 +417,6 @@ func checkUsername(client *http.Client, proxy, username string, availableOut cha
 		latSumMs.Add(time.Since(reqStart).Milliseconds())
 		latCount.Add(1)
 
-		// QUALQUER erro de conexao conta (timeout, EOF, reset, desconhecido...).
 		if err != nil {
 			markError()
 			if attempt < retriesTransient {
@@ -630,7 +427,6 @@ func checkUsername(client *http.Client, proxy, username string, availableOut cha
 			logLine(cGray, "ERRO", username, trimErr(err)+" "+short(proxy))
 			return
 		}
-		// status != 200 (429, 5xx, etc) tambem conta como erro.
 		if status != http.StatusOK {
 			markError()
 			if attempt < retriesTransient {
@@ -642,7 +438,6 @@ func checkUsername(client *http.Client, proxy, username string, availableOut cha
 			return
 		}
 
-		// resposta 200 valida -> classifica pelo code
 		markValid()
 		switch code {
 		case 0:
@@ -651,12 +446,12 @@ func checkUsername(client *http.Client, proxy, username string, availableOut cha
 				logLine(cGreen, "LIVRE", username, "*** NOVO ***")
 				availableOut <- username
 				if autoClaimEnabled {
-					go claimUsername(username)
+					go attemptClaim(username)
 				}
 				if webhookEnabled {
 					select {
 					case webhookQueue <- username:
-					default: // fila cheia: nao trava a checagem
+					default:
 						logLine(cGray, "HOOK", username, "fila da webhook cheia, pulado")
 					}
 				}
@@ -666,7 +461,7 @@ func checkUsername(client *http.Client, proxy, username string, availableOut cha
 		case 1:
 			takenCount.Add(1)
 			logLine(cRed, "USADO", username, "")
-		default: // code 2 (improprio), 10 (formato) e outros bloqueios
+		default:
 			blockedCount.Add(1)
 			logLine(cCyan, "BLOCK", username, "")
 		}
@@ -675,7 +470,6 @@ func checkUsername(client *http.Client, proxy, username string, availableOut cha
 }
 
 func short(proxy string) string {
-	// mostra so o host da proxy no log, sem credenciais
 	if u, err := url.Parse(normalizeProxy(proxy)); err == nil && u.Host != "" {
 		return u.Host
 	}
@@ -685,11 +479,6 @@ func short(proxy string) string {
 	return proxy
 }
 
-// runProxy: roda requestsEmVooPorProxy goroutines por proxy, TODAS gated pelo
-// mesmo ticker (proxyMinInterval) — entao a proxy nunca passa de proxyRateLimit/min,
-// mas com varias requests em voo a latencia nao serializa e ela satura o teto de
-// 1000/min (em vez de ficar presa em ~1/latencia). Depois de checar, reschedule
-// re-agenda o nome pra daqui delayPorUsername.
 func runProxy(proxy string, jobs <-chan string, reschedule func(string), availableOut chan<- string, wg *sync.WaitGroup) {
 	defer wg.Done()
 
@@ -699,7 +488,7 @@ func runProxy(proxy string, jobs <-chan string, reschedule func(string), availab
 		return
 	}
 	defer client.CloseIdleConnections()
-	activeProxies.Add(1) // essa proxy entrou em operacao
+	activeProxies.Add(1)
 
 	ticker := time.NewTicker(proxyMinInterval)
 	defer ticker.Stop()
@@ -710,7 +499,7 @@ func runProxy(proxy string, jobs <-chan string, reschedule func(string), availab
 		go func() {
 			defer sub.Done()
 			for username := range jobs {
-				<-ticker.C // teto compartilhado: <= proxyRateLimit/min por proxy
+				<-ticker.C
 				checkUsername(client, proxy, username, availableOut)
 				reschedule(username)
 			}
@@ -763,7 +552,6 @@ func main() {
 		colorize(cGreen, "LIVRE"), colorize(cRed, "USADO"), colorize(cCyan, "BLOCK"),
 		colorize(cYellow, "429"), colorize(cGray, "ERRO"))
 
-	// saida: available.txt (flush a cada nome pra nao perder progresso)
 	outF, err := os.Create(outputFile)
 	if err != nil {
 		fmt.Println("[FATAL] nao criou", outputFile, ":", err)
@@ -783,20 +571,14 @@ func main() {
 		}
 	}()
 
-	// worker da webhook do Discord (serializa envios e respeita rate limit)
 	if webhookEnabled {
 		go webhookWorker()
 	}
 
-	// FILA POR USERNAME: cada nome, depois de checado, so volta pra fila daqui
-	// delayPorUsername (4s). Assim cada username e re-checado a cada ~4s por
-	// QUALQUER proxy. As proxies puxam daqui, cada uma limitada a proxyRateLimit.
 	jobs := make(chan string, len(usernames)+1)
 	var remaining atomic.Int64
 	remaining.Store(int64(len(usernames)))
 
-	// reschedule: chamado depois de checar um nome. No modo loop, re-enfileira
-	// esse nome daqui delayPorUsername. Em passada unica, conta ate zerar e fecha.
 	reschedule := func(u string) {
 		if !loopForever {
 			if remaining.Add(-1) == 0 {
@@ -806,18 +588,16 @@ func main() {
 		}
 		if skipFound {
 			if _, ok := foundAvailable.Load(u); ok {
-				return // ja achado livre: sai de rotacao
+				return
 			}
 		}
 		time.AfterFunc(delayPorUsername, func() { jobs <- u })
 	}
 
-	// seed: todos comecam "vencidos" (elegiveis pra checar agora).
 	for _, u := range usernames {
 		jobs <- u
 	}
 
-	// printer de progresso
 	startTime = time.Now()
 	done := make(chan struct{})
 	go func() {
@@ -833,8 +613,6 @@ func main() {
 		}
 	}()
 
-	// dispara 1 goroutine por proxy, mas SOBE AOS POUCOS (startupRampPerSec) pra
-	// nao dar thundering-herd de TLS handshake (que causava handshake timeout).
 	launchDelay := time.Second / time.Duration(startupRampPerSec)
 	rampSecs := len(proxies) / startupRampPerSec
 	fmt.Printf("Subindo %d proxies a %d/s (~%ds pra todas ficarem online)...\n\n", len(proxies), startupRampPerSec, rampSecs)
@@ -858,7 +636,6 @@ func main() {
 func printProgress(total int) {
 	checked := checkedCount.Load()
 	errs := errorCount.Load()
-	// ciclo real = quantas passadas completas ja foram efetivamente checadas
 	processed := checked + errs
 	cycle := processed/int64(total) + 1
 	inCycle := processed % int64(total)
@@ -866,7 +643,7 @@ func printProgress(total int) {
 	if n := latCount.Load(); n > 0 {
 		avgLat = latSumMs.Load() / n
 	}
-	line := fmt.Sprintf("── ciclo %d (%d/%d) | CPM %d · EPM %d | ativas %d | lat ~%dms | livre %d · uso %d · bloq %d · erro %d ──",
+	line := fmt.Sprintf("-- ciclo %d (%d/%d) | CPM %d . EPM %d | ativas %d | lat ~%dms | livre %d . uso %d . bloq %d . erro %d --",
 		cycle, inCycle, total, cpmWin.perMinute(), epmWin.perMinute(),
 		activeProxies.Load(), avgLat,
 		availableCount.Load(), takenCount.Load(), blockedCount.Load(), errs)
